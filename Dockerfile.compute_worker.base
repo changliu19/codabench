@@ -1,0 +1,32 @@
+FROM --platform=linux/amd64 hub.youtupi.me/library/fedora:42
+
+# Make Python output unbuffered for logs
+ENV PYTHONUNBUFFERED 1
+
+# Install Docker tooling and system deps
+RUN dnf -y install dnf-plugins-core && \
+    dnf-3 config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo && \
+    sed -i 's+https://download.docker.com+https://mirrors.ustc.edu.cn/docker-ce/+' /etc/yum.repos.d/docker-ce.repo && \
+    dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
+    dnf -y update && \
+    dnf install -y python3.9 && \
+    dnf clean all && \
+    rm -rf /var/cache /var/log/dnf* /var/log/yum.*
+
+# Install Poetry (pinned) and configure to use system Python
+RUN curl -sSL https://install.python-poetry.org | python3.9 - --version 1.8.3
+ENV PATH $PATH:/root/.local/bin
+RUN poetry config virtualenvs.create false
+RUN poetry config virtualenvs.in-project false
+
+WORKDIR /app
+
+# Copy only dependency manifests so this layer is cached when code changes
+COPY ./compute_worker/pyproject.toml ./compute_worker/poetry.lock ./
+RUN poetry config virtualenvs.prefer-active-python true \
+    && poetry install --no-interaction --no-ansi
+
+# (Optional) create a non-root user for running the worker
+RUN useradd -m worker || true
+
+CMD ["/bin/bash"]
