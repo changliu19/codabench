@@ -12,9 +12,7 @@ import time
 import uuid
 from shutil import make_archive
 from subprocess import CalledProcessError, check_output
-from urllib.error import HTTPError
 from urllib.parse import urlparse
-from urllib.request import urlretrieve
 from zipfile import ZipFile, BadZipFile
 
 import requests
@@ -265,7 +263,7 @@ class Run:
         # Nice requests adapter with generous retries/etc.
         self.requests_session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(max_retries=Retry(
-            total=3,
+            total=15,
             backoff_factor=1,
         ))
         self.requests_session.mount('http://', adapter)
@@ -463,10 +461,14 @@ class Run:
         while retries < max_retries:
             if download_needed:
                 try:
-                    # Download the bundle
-                    urlretrieve(url, bundle_file)
-                except HTTPError:
-                    raise SubmissionException(f"Problem fetching {url} to put in {destination}")
+                    # Download the bundle using requests_session to benefit from adapter configuration (retries, proxy, etc.)
+                    response = self.requests_session.get(url, stream=True, timeout=150)
+                    response.raise_for_status()
+                    with open(bundle_file, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                except requests.RequestException as e:
+                    raise SubmissionException(f"Problem fetching {url} to put in {destination}: {e}")
             try:
                 # Extract the contents to destination directory
                 with ZipFile(bundle_file, 'r') as z:
@@ -477,8 +479,8 @@ class Run:
                 if retries >= max_retries:
                     raise  # Re-raise the last caught BadZipFile exception
                 else:
-                    logger.warning("Failed. Retrying in 60 seconds...")
-                    time.sleep(60)  # Wait 60 seconds before retrying
+                    logger.warning("Failed. Retrying in 3 seconds...")
+                    time.sleep(3)  # Wait 3 seconds before retrying
         # Return the zip file path for other uses, e.g. for creating a MD5 hash to identify it
         return bundle_file
 
@@ -817,7 +819,15 @@ class Run:
         ]
         if self.is_scoring:
             # Send along submission result so scoring_program can get access
-            bundles += [(self.prediction_result, 'input/res')]
+            # bundles += [(self.prediction_result, 'input/res')]
+
+            # Move prediction result to input/res for scoring program
+            cache_dir = os.path.join(CACHE_DIR, str(self.submission_id))
+            if not os.path.exists(cache_dir):
+                raise SubmissionException(f"Could not find cached submission result")
+            res_path = os.path.join(self.root_dir, 'input', 'res')
+            logger.info(f"Moving prediction result from {cache_dir} to {res_path} for scoring program")
+            shutil.move(cache_dir, res_path)
 
         for url, path in bundles:
             if url is not None:
@@ -833,6 +843,13 @@ class Run:
                     checksum = md5(zip_file)
                     logger.info(f"Checksum result: {checksum}")
                     self._update_submission({"md5": checksum})
+
+                    # Move submission result to input/res for scoring program
+                    res_path = os.path.join(self.root_dir, 'program')
+                    dest_path = os.path.join(CACHE_DIR, str(self.submission_id))
+                    logger.info(f"Moving submission result from {res_path} to {dest_path} for scoring program")
+                    shutil.move(res_path, dest_path)
+                    os.makedirs(res_path, exist_ok=True)  # recreate empty submission dir
 
         # For logging purposes let's dump file names
         for filename in glob.iglob(self.root_dir + '**/*.*', recursive=True):
