@@ -1,20 +1,16 @@
-FROM almalinux:10-minimal
+# syntax=docker/dockerfile:1.7
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
-RUN microdnf install -y tar gzip
-
-# This makes output not buffer and return immediately, nice for seeing results in stdout
 ENV PYTHONUNBUFFERED=1
-
-COPY compute_worker/pyproject.toml compute_worker/uv.lock compute_worker/celery_config.py compute_worker/compute_worker.py ./
-
-# Install UV and add paths to PATH for uv and the future .venv created by uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && microdnf remove -y tar gzip && microdnf clean all
-ENV PATH=$PATH:/root/.local/bin
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
 ENV PATH=$PATH:/.venv/bin
 
+WORKDIR /app
 
-# Install dependencies
-RUN uv sync --frozen
+COPY compute_worker/pyproject.toml compute_worker/uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project
+COPY compute_worker/celery_config.py compute_worker/compute_worker.py ./
 COPY src/settings/logs_loguru.py /.venv/bin
 
 ENTRYPOINT ["/bin/bash", "-c"]

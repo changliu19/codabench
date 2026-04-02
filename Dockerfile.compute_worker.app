@@ -1,11 +1,11 @@
-FROM codalab/compute_worker:base
+FROM local_compute_worker:base
 
 ENV PYTHONUNBUFFERED 1
 ENV DOCKER_API_VERSION 1.42
 
 WORKDIR /app
 
-ADD compute_worker .
+COPY ./compute_worker/celery_config.py ./compute_worker/compute_worker.py ./
 COPY ./src/settings/logs_loguru.py /.venv/bin
 
 CMD celery -A compute_worker worker \

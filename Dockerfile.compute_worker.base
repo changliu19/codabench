@@ -1,24 +1,15 @@
-FROM --platform=linux/amd64 hub.youtupi.me/library/fedora:42
+# syntax=docker/dockerfile:1.7
+FROM --platform=linux/amd64 ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
-ENV PYTHONUNBUFFERED 1
-
-RUN dnf -y install dnf-plugins-core && \
-    dnf-3 config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo && \
-    sed -i 's+https://download.docker.com+https://mirrors.ustc.edu.cn/docker-ce/+' /etc/yum.repos.d/docker-ce.repo && \
-    dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
-    dnf -y update && \
-    dnf install -y python3.9 && \
-    dnf clean all && \
-    rm -rf /var/cache /var/log/dnf* /var/log/yum.*
-
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH $PATH:/root/.local/bin
-ENV PATH $PATH:/.venv/bin
+ENV PYTHONUNBUFFERED=1
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+ENV PATH=$PATH:/.venv/bin
 
 WORKDIR /app
 
 COPY ./compute_worker/pyproject.toml ./compute_worker/uv.lock ./
-RUN uv sync --frozen
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project
 
 RUN useradd -m worker || true
 
