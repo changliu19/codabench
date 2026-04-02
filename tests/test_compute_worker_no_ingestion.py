@@ -170,16 +170,19 @@ class ComputeWorkerNoIngestionTests(unittest.TestCase):
     def test_download_bundle_uses_aria2c_when_available(self):
         run = self._make_run()
         bundle_file = os.path.join(self.tmpdir, "bundle.zip")
+        process = mock.Mock()
+        process.stdout = iter(["[#1 1.0MiB/2.0MiB(50%) CN:4 DL:2.0MiB]\n"])
+        process.wait.return_value = 0
 
         with (
             mock.patch.object(cw, "USE_ARIA2C", True),
             mock.patch.object(cw.shutil, "which", return_value="/usr/bin/aria2c"),
-            mock.patch.object(cw.subprocess, "run", return_value=mock.Mock(returncode=0)) as run_mock,
+            mock.patch.object(cw.subprocess, "Popen", return_value=process) as popen_mock,
         ):
             run._download_bundle("https://example.com/test.zip", bundle_file)
 
         run.requests_session.get.assert_not_called()
-        cmd = run_mock.call_args.args[0]
+        cmd = popen_mock.call_args.args[0]
         self.assertIn("/usr/bin/aria2c", cmd)
         self.assertIn("--split=8", cmd)
         self.assertIn("https://example.com/test.zip", cmd)
@@ -209,14 +212,17 @@ class ComputeWorkerNoIngestionTests(unittest.TestCase):
         response = mock.Mock()
         response.iter_content.return_value = [b"fallback"]
         run.requests_session.get.return_value = response
+        process = mock.Mock()
+        process.stdout = iter(["error line\n"])
+        process.wait.return_value = 1
 
         with (
             mock.patch.object(cw, "USE_ARIA2C", True),
             mock.patch.object(cw.shutil, "which", return_value="/usr/bin/aria2c"),
             mock.patch.object(
                 cw.subprocess,
-                "run",
-                return_value=mock.Mock(returncode=1, stderr="boom"),
+                "Popen",
+                return_value=process,
             ),
         ):
             run._download_bundle("https://example.com/test.zip", bundle_file)

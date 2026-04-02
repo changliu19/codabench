@@ -791,12 +791,28 @@ class Run:
             os.path.basename(bundle_file),
             url,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        output_lines = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            output_lines.append(line)
+            logger.info("aria2c: %s", line)
+
+        return_code = process.wait()
+        if return_code != 0:
             logger.warning(
                 "aria2c download failed with code %s, stderr: %s",
-                result.returncode,
-                result.stderr.strip(),
+                return_code,
+                " | ".join(output_lines[-10:]),
             )
             return False
         return True
