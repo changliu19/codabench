@@ -7,6 +7,7 @@ import traceback
 import shutil
 import signal
 import socket
+import subprocess
 import tempfile
 import time
 import uuid
@@ -179,6 +180,9 @@ BASE_DIR = "/codabench/"  # base directory inside the container
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 MAX_CACHE_DIR_SIZE_GB = float(os.environ.get("MAX_CACHE_DIR_SIZE_GB", 10))
 DISABLE_INGESTION = os.environ.get("CODABENCH_DISABLE_INGESTION", "true").lower() == "true"
+USE_ARIA2C = os.environ.get("CODABENCH_USE_ARIA2C", "true").lower() == "true"
+ARIA2C_SPLIT = os.environ.get("CODABENCH_ARIA2C_SPLIT", "8")
+ARIA2C_MIN_SPLIT_SIZE = os.environ.get("CODABENCH_ARIA2C_MIN_SPLIT_SIZE", "4M")
 
 
 # -----------------------------------------------
@@ -736,12 +740,8 @@ class Run:
             if download_needed:
                 try:
                     url = rewrite_bundle_url_if_needed(url)
-                    response = self.requests_session.get(url, stream=True, timeout=150)
-                    response.raise_for_status()
-                    with open(bundle_file, "wb") as bundle:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            bundle.write(chunk)
-                except requests.RequestException as e:
+                    self._download_bundle(url, bundle_file)
+                except (requests.RequestException, OSError, subprocess.SubprocessError) as e:
                     raise SubmissionException(
                         f"Problem fetching {url} to put in {destination}: {e}"
                     )
@@ -759,6 +759,56 @@ class Run:
                     time.sleep(3)  # Wait 3 seconds before retrying
         # Return the zip file path for other uses, e.g. for creating a MD5 hash to identify it
         return bundle_file
+
+    def _download_bundle(self, url, bundle_file):
+        if USE_ARIA2C and self._download_bundle_with_aria2c(url, bundle_file):
+            return
+        self._download_bundle_with_requests(url, bundle_file)
+
+    def _download_bundle_with_aria2c(self, url, bundle_file):
+        aria2c_bin = shutil.which("aria2c")
+        if not aria2c_bin:
+            logger.info("aria2c is not installed, falling back to requests")
+            return False
+
+        logger.info(f"Downloading bundle with aria2c: {url}")
+        cmd = [
+            aria2c_bin,
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--continue=true",
+            f"--max-connection-per-server={ARIA2C_SPLIT}",
+            f"--split={ARIA2C_SPLIT}",
+            f"--min-split-size={ARIA2C_MIN_SPLIT_SIZE}",
+            "--retry-wait=2",
+            "--max-tries=5",
+            "--connect-timeout=30",
+            "--timeout=150",
+            "--file-allocation=none",
+            "--dir",
+            os.path.dirname(bundle_file),
+            "--out",
+            os.path.basename(bundle_file),
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning(
+                "aria2c download failed with code %s, stderr: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return False
+        return True
+
+    def _download_bundle_with_requests(self, url, bundle_file):
+        logger.info(f"Downloading bundle with requests: {url}")
+        response = self.requests_session.get(url, stream=True, timeout=150)
+        response.raise_for_status()
+        with open(bundle_file, "wb") as bundle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    bundle.write(chunk)
 
     async def _run_container_engine_cmd(self, container, kind):
         """This runs a command and asynchronously writes the data to both a storage file

@@ -164,7 +164,66 @@ class ComputeWorkerNoIngestionTests(unittest.TestCase):
         run.ingestion_elapsed_time = None
         run.completed_program_counter = 0
         run.watch = True
+        run.requests_session = mock.Mock()
         return run
+
+    def test_download_bundle_uses_aria2c_when_available(self):
+        run = self._make_run()
+        bundle_file = os.path.join(self.tmpdir, "bundle.zip")
+
+        with (
+            mock.patch.object(cw, "USE_ARIA2C", True),
+            mock.patch.object(cw.shutil, "which", return_value="/usr/bin/aria2c"),
+            mock.patch.object(cw.subprocess, "run", return_value=mock.Mock(returncode=0)) as run_mock,
+        ):
+            run._download_bundle("https://example.com/test.zip", bundle_file)
+
+        run.requests_session.get.assert_not_called()
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("/usr/bin/aria2c", cmd)
+        self.assertIn("--split=8", cmd)
+        self.assertIn("https://example.com/test.zip", cmd)
+
+    def test_download_bundle_falls_back_to_requests_when_aria2c_missing(self):
+        run = self._make_run()
+        bundle_file = os.path.join(self.tmpdir, "bundle.zip")
+        response = mock.Mock()
+        response.iter_content.return_value = [b"abc", b"def"]
+        run.requests_session.get.return_value = response
+
+        with (
+            mock.patch.object(cw, "USE_ARIA2C", True),
+            mock.patch.object(cw.shutil, "which", return_value=None),
+        ):
+            run._download_bundle("https://example.com/test.zip", bundle_file)
+
+        run.requests_session.get.assert_called_once_with(
+            "https://example.com/test.zip", stream=True, timeout=150
+        )
+        with open(bundle_file, "rb") as fh:
+            self.assertEqual(fh.read(), b"abcdef")
+
+    def test_download_bundle_falls_back_to_requests_when_aria2c_fails(self):
+        run = self._make_run()
+        bundle_file = os.path.join(self.tmpdir, "bundle.zip")
+        response = mock.Mock()
+        response.iter_content.return_value = [b"fallback"]
+        run.requests_session.get.return_value = response
+
+        with (
+            mock.patch.object(cw, "USE_ARIA2C", True),
+            mock.patch.object(cw.shutil, "which", return_value="/usr/bin/aria2c"),
+            mock.patch.object(
+                cw.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=1, stderr="boom"),
+            ),
+        ):
+            run._download_bundle("https://example.com/test.zip", bundle_file)
+
+        run.requests_session.get.assert_called_once()
+        with open(bundle_file, "rb") as fh:
+            self.assertEqual(fh.read(), b"fallback")
 
     def test_cache_and_restore_submission_bundle(self):
         run = self._make_run()
