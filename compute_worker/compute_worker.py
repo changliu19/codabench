@@ -11,9 +11,7 @@ import tempfile
 import time
 import uuid
 from shutil import make_archive
-from urllib.error import HTTPError
 from urllib.parse import urlparse
-from urllib.request import urlretrieve
 from zipfile import ZipFile, BadZipFile
 import docker
 from rich.progress import Progress
@@ -180,6 +178,7 @@ HOST_DIRECTORY = os.environ.get("HOST_DIRECTORY", "/tmp/codabench/")
 BASE_DIR = "/codabench/"  # base directory inside the container
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 MAX_CACHE_DIR_SIZE_GB = float(os.environ.get("MAX_CACHE_DIR_SIZE_GB", 10))
+DISABLE_INGESTION = os.environ.get("CODABENCH_DISABLE_INGESTION", "true").lower() == "true"
 
 
 # -----------------------------------------------
@@ -415,6 +414,7 @@ class Run:
         self.prediction_result = run_args["prediction_result"]
         self.scoring_result = run_args.get("scoring_result")
         self.execution_time_limit = run_args["execution_time_limit"]
+        self.disable_ingestion = run_args.get("disable_ingestion", DISABLE_INGESTION)
         # stdout and stderr
         self.stdout, self.stderr, self.ingestion_stdout, self.ingestion_stderr = (
             self._get_stdout_stderr_file_names(run_args)
@@ -448,12 +448,52 @@ class Run:
         self.requests_session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=Retry(
-                total=3,
+                total=15,
                 backoff_factor=1,
             )
         )
         self.requests_session.mount("http://", adapter)
         self.requests_session.mount("https://", adapter)
+
+    def _submission_cache_dir(self):
+        return os.path.join(CACHE_DIR, f"submission_{self.submission_id}")
+
+    def _cache_submission_for_scoring(self):
+        cache_dir = self._submission_cache_dir()
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        # Reuse the original submission bundle for scoring instead of re-downloading a prediction artifact.
+        shutil.copytree(os.path.join(self.root_dir, "program"), cache_dir)
+        logger.info(f"Cached submission bundle for scoring at {cache_dir}")
+
+    def _restore_cached_submission_for_scoring(self):
+        cache_dir = self._submission_cache_dir()
+        if not os.path.exists(cache_dir):
+            raise SubmissionException(
+                f"Cached submission bundle not found at {cache_dir}. "
+                "No-ingestion scoring requires prediction and scoring to share the worker cache."
+            )
+
+        res_path = os.path.join(self.root_dir, "input", "res")
+        if os.path.exists(res_path):
+            shutil.rmtree(res_path)
+        os.makedirs(os.path.dirname(res_path), exist_ok=True)
+        shutil.copytree(cache_dir, res_path)
+        logger.info(f"Restored cached submission bundle from {cache_dir} to {res_path}")
+
+    def _should_run_prediction_program(self):
+        return self.is_scoring or not self.disable_ingestion
+
+    def _should_run_ingestion_program(self):
+        return not self.disable_ingestion
+
+    def _expected_program_task_count(self):
+        count = 0
+        if self.is_scoring or self._should_run_prediction_program():
+            count += 1
+        if self._should_run_ingestion_program():
+            count += 1
+        return count
 
     async def watch_detailed_results(self):
         """Watches files alongside scoring + program containers, currently only used
@@ -465,7 +505,7 @@ class Run:
         start = time.time()
         expiration_seconds = 60
 
-        while self.watch and self.completed_program_counter < 2:
+        while self.watch and self.completed_program_counter < self._expected_program_task_count():
             if file_path:
                 new_time = os.path.getmtime(file_path)
                 if new_time != last_modified_time:
@@ -695,12 +735,15 @@ class Run:
         while retries < max_retries:
             if download_needed:
                 try:
-                    # Download the bundle
                     url = rewrite_bundle_url_if_needed(url)
-                    urlretrieve(url, bundle_file)
-                except HTTPError:
+                    response = self.requests_session.get(url, stream=True, timeout=150)
+                    response.raise_for_status()
+                    with open(bundle_file, "wb") as bundle:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            bundle.write(chunk)
+                except requests.RequestException as e:
                     raise SubmissionException(
-                        f"Problem fetching {url} to put in {destination}"
+                        f"Problem fetching {url} to put in {destination}: {e}"
                     )
             try:
                 # Extract the contents to destination directory
@@ -712,8 +755,8 @@ class Run:
                 if retries >= max_retries:
                     raise SubmissionException("Bad or empty zip file")
                 else:
-                    logger.warning("Failed. Retrying in 20 seconds...")
-                    time.sleep(20)  # Wait 20 seconds before retrying
+                    logger.warning("Failed. Retrying in 3 seconds...")
+                    time.sleep(3)  # Wait 3 seconds before retrying
         # Return the zip file path for other uses, e.g. for creating a MD5 hash to identify it
         return bundle_file
 
@@ -1215,13 +1258,13 @@ class Run:
         bundles = [
             # (url to file, relative folder destination)
             (self.program_data, "program"),
-            (self.ingestion_program_data, "ingestion_program"),
             (self.input_data, "input_data"),
             (self.reference_data, "input/ref"),
         ]
+        if self._should_run_ingestion_program():
+            bundles.insert(1, (self.ingestion_program_data, "ingestion_program"))
         if self.is_scoring:
-            # Send along submission result so scoring_program can get access
-            bundles += [(self.prediction_result, "input/res")]
+            self._restore_cached_submission_for_scoring()
 
         for url, path in bundles:
             if url is not None:
@@ -1237,16 +1280,30 @@ class Run:
                     checksum = md5(zip_file)
                     logger.info(f"Checksum result: {checksum}")
                     self._update_submission({"md5": checksum})
+                    if self.disable_ingestion:
+                        self._cache_submission_for_scoring()
 
         # For logging purposes let's dump file names
         for filename in glob.iglob(self.root_dir + "**/*.*", recursive=True):
             logger.info(filename)
 
-        # Before the run starts we want to download images, they may take a while to download
-        # and to do this during the run would subtract from the participants time.
-        self._get_container_image(self.container_image)
+        if self.is_scoring or not self.disable_ingestion:
+            # Before the run starts we want to download images, they may take a while to download
+            # and to do this during the run would subtract from the participants time.
+            self._get_container_image(self.container_image)
 
     def start(self):
+        if not self._should_run_prediction_program() and not self.is_scoring:
+            logger.info(
+                "No-ingestion mode enabled: skipping prediction execution and using the cached submission bundle for scoring."
+            )
+            self.program_exit_code = 0
+            self.program_elapsed_time = 0
+            self.ingestion_program_exit_code = 0
+            self.ingestion_elapsed_time = 0
+            self._update_status(STATUS_SCORING)
+            return
+
         program_dir = os.path.join(self.root_dir, "program")
         ingestion_program_dir = os.path.join(self.root_dir, "ingestion_program")
 
@@ -1254,12 +1311,13 @@ class Run:
         loop = asyncio.new_event_loop()
         # Set the event loop for the gather
         asyncio.set_event_loop(loop)
-        gathered_tasks = asyncio.gather(
-            self._run_program_directory(program_dir, kind="program"),
-            self._run_program_directory(ingestion_program_dir, kind="ingestion"),
-            self.watch_detailed_results(),
-            return_exceptions=True,
-        )
+        tasks = []
+        if self.is_scoring or self._should_run_prediction_program():
+            tasks.append(self._run_program_directory(program_dir, kind="program"))
+        if self._should_run_ingestion_program():
+            tasks.append(self._run_program_directory(ingestion_program_dir, kind="ingestion"))
+        tasks.append(self.watch_detailed_results())
+        gathered_tasks = asyncio.gather(*tasks, return_exceptions=True)
         task_results = []  # will store results/exceptions from gather
         signal.signal(signal.SIGALRM, alarm_handler)
         signal.alarm(self.execution_time_limit)
@@ -1372,7 +1430,7 @@ class Run:
 
         if self.is_scoring:
             # Check if scoring program failed
-            program_results, _, _ = task_results
+            program_results = task_results[0] if task_results else None
             # Gather returns either normal values or exception instances when return_exceptions=True
             had_async_exc = isinstance(
                 program_results, BaseException
