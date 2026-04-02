@@ -6,7 +6,7 @@ ENV DOCKER_API_VERSION 1.42
 WORKDIR /app
 
 COPY ./compute_worker/celery_config.py ./compute_worker/compute_worker.py ./
-COPY ./src/settings/logs_loguru.py /.venv/bin
+COPY ./src/settings/logs_loguru.py /app/.venv/bin
 
 CMD celery -A compute_worker worker \
     -l info \

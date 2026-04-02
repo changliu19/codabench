@@ -4,14 +4,14 @@ FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 ENV PYTHONUNBUFFERED=1
 ENV UV_LINK_MODE=copy
 ENV UV_COMPILE_BYTECODE=1
-ENV PATH=$PATH:/.venv/bin
+ENV PATH=$PATH:/app/.venv/bin
 
 WORKDIR /app
 
 COPY compute_worker/pyproject.toml compute_worker/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project
 COPY compute_worker/celery_config.py compute_worker/compute_worker.py ./
-COPY src/settings/logs_loguru.py /.venv/bin
+COPY src/settings/logs_loguru.py /app/.venv/bin
 
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["celery -A compute_worker worker -l info -Q compute-worker -n compute-worker@$HOSTNAME --concurrency=1"]
