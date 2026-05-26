@@ -1,6 +1,6 @@
 FROM almalinux:10-minimal
 
-RUN microdnf install -y tar gzip
+RUN microdnf install -y epel-release tar gzip && microdnf install -y aria2
 
 # This makes output not buffer and return immediately, nice for seeing results in stdout
 ENV PYTHONUNBUFFERED=1
@@ -15,7 +15,7 @@ ENV PATH=$PATH:/.venv/bin
 
 # Install dependencies
 RUN uv sync --frozen
-COPY src/settings/logs_loguru.py /.venv/bin
+COPY src/settings/logs_loguru.py ./
 
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["celery -A compute_worker worker -l info -Q compute-worker -n compute-worker@$HOSTNAME --concurrency=1"]

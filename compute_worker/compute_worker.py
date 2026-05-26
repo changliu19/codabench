@@ -7,6 +7,7 @@ import traceback
 import shutil
 import signal
 import socket
+import subprocess
 import tempfile
 import time
 import uuid
@@ -17,9 +18,7 @@ import docker
 import logging
 import sys  # This is only needed for the pytests to pass
 from shutil import make_archive
-from urllib.error import HTTPError
 from urllib.parse import urlparse
-from urllib.request import urlretrieve
 from zipfile import ZipFile, BadZipFile
 from urllib3 import Retry
 
@@ -109,9 +108,12 @@ class Settings:
     COMPETITION_CONTAINER_HTTP_PROXY = get("COMPETITION_CONTAINER_HTTP_PROXY", "")
     COMPETITION_CONTAINER_HTTPS_PROXY = get("COMPETITION_CONTAINER_HTTPS_PROXY", "")
 
-    CODALAB_IGNORE_CLEANUP_STEP = to_bool(get("CODALAB_IGNORE_CLEANUP_STEP"))
+    CODALAB_IGNORE_CLEANUP_STEP = to_bool(get("CODALAB_IGNORE_CLEANUP_STEP", "false"))
 
     WORKER_BUNDLE_URL_REWRITE = get("WORKER_BUNDLE_URL_REWRITE", "").strip()
+    USE_ARIA2C = to_bool(get("CODABENCH_USE_ARIA2C", "true"))
+    ARIA2C_SPLIT = get("CODABENCH_ARIA2C_SPLIT", "8")
+    ARIA2C_MIN_SPLIT_SIZE = get("CODABENCH_ARIA2C_MIN_SPLIT_SIZE", "4M")
 
 
 # -----------------------------------------------
@@ -486,6 +488,9 @@ class Run:
         self.input_data = run_args.get("input_data")
         self.reference_data = run_args.get("reference_data")
         self.ingestion_only_during_scoring = run_args.get("ingestion_only_during_scoring")
+        self.has_ingestion_program = Settings.to_bool(
+            run_args.get("has_ingestion_program", bool(self.ingestion_program_data))
+        )
         self.detailed_results_url = run_args.get("detailed_results_url")
 
         self.ingestion_program_exit_code = None
@@ -503,12 +508,15 @@ class Run:
         self.requests_session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=Retry(
-                total=3,
+                total=15,
                 backoff_factor=1,
             )
         )
         self.requests_session.mount("http://", adapter)
         self.requests_session.mount("https://", adapter)
+
+    def _prediction_ingestion_runs(self):
+        return self.has_ingestion_program and not self.ingestion_only_during_scoring
 
     async def watch_detailed_results(self):
         """Watches files alongside scoring + program containers, currently only used
@@ -753,12 +761,11 @@ class Run:
         while retries < max_retries:
             if download_needed:
                 try:
-                    # Download the bundle
                     url = rewrite_bundle_url_if_needed(url)
-                    urlretrieve(url, bundle_file)
-                except HTTPError:
+                    self._download_bundle(url, bundle_file)
+                except (requests.RequestException, OSError, subprocess.SubprocessError) as e:
                     raise SubmissionException(
-                        f"Problem fetching {url} to put in {destination}"
+                        f"Problem fetching {url} to put in {destination}: {e}"
                     )
             try:
                 # Extract the contents to destination directory
@@ -770,10 +777,76 @@ class Run:
                 if retries >= max_retries:
                     raise SubmissionException("Bad or empty zip file")
                 else:
-                    logger.warning("Failed. Retrying in 20 seconds...")
-                    time.sleep(20)  # Wait 20 seconds before retrying
+                    logger.warning("Failed. Retrying in 3 seconds...")
+                    time.sleep(3)  # Wait 3 seconds before retrying
         # Return the zip file path for other uses, e.g. for creating a MD5 hash to identify it
         return bundle_file
+
+    def _download_bundle(self, url, bundle_file):
+        if Settings.USE_ARIA2C and self._download_bundle_with_aria2c(url, bundle_file):
+            return
+        self._download_bundle_with_requests(url, bundle_file)
+
+    def _download_bundle_with_aria2c(self, url, bundle_file):
+        aria2c_bin = shutil.which("aria2c")
+        if not aria2c_bin:
+            logger.info("aria2c is not installed, falling back to requests")
+            return False
+
+        logger.info(f"Downloading bundle with aria2c: {url}")
+        cmd = [
+            aria2c_bin,
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--continue=true",
+            f"--max-connection-per-server={Settings.ARIA2C_SPLIT}",
+            f"--split={Settings.ARIA2C_SPLIT}",
+            f"--min-split-size={Settings.ARIA2C_MIN_SPLIT_SIZE}",
+            "--retry-wait=2",
+            "--max-tries=5",
+            "--connect-timeout=30",
+            "--timeout=150",
+            "--file-allocation=none",
+            "--dir",
+            os.path.dirname(bundle_file),
+            "--out",
+            os.path.basename(bundle_file),
+            url,
+        ]
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        output_lines = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            output_lines.append(line)
+            logger.info("aria2c: %s", line)
+
+        return_code = process.wait()
+        if return_code != 0:
+            logger.warning(
+                "aria2c download failed with code %s, stderr: %s",
+                return_code,
+                " | ".join(output_lines[-10:]),
+            )
+            return False
+        return True
+
+    def _download_bundle_with_requests(self, url, bundle_file):
+        logger.info(f"Downloading bundle with requests: {url}")
+        response = self.requests_session.get(url, stream=True, timeout=150)
+        response.raise_for_status()
+        with open(bundle_file, "wb") as bundle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    bundle.write(chunk)
 
     def _create_container(
         self,
@@ -1249,8 +1322,8 @@ class Run:
             (self.input_data, "input_data"),
             (self.reference_data, "input/ref"),
         ]
-        if self.is_scoring:
-            # Send along submission result so scoring_program can get access
+        if self.is_scoring and self._prediction_ingestion_runs():
+            # Send along ingestion output so scoring_program can get access.
             bundles += [(self.prediction_result, "input/res")]
 
         for url, path in bundles:
@@ -1277,14 +1350,24 @@ class Run:
         for filename in glob.iglob(self.root_dir + "**/*.*", recursive=True):
             logger.info(filename)
 
-        # Before the run starts we want to download images, they may take a while to download
-        # and to do this during the run would subtract from the participants time.
-        self._get_container_image(self.container_image)
-        self._update_status(SubmissionStatus.RUNNING)
+        if self.is_scoring or self.ingestion_program_data:
+            # Before the run starts we want to download images, they may take a while to download
+            # and to do this during the run would subtract from the participants time.
+            self._get_container_image(self.container_image)
+            self._update_status(SubmissionStatus.RUNNING)
 
     def start(self):
 
         logger.info(f"Preparing to run: {ProgramKind.SCORING_PROGRAM if self.is_scoring else ProgramKind.INGESTION_PROGRAM}")
+
+        if not self.is_scoring and not self.ingestion_program_data:
+            logger.info(
+                "No ingestion program for prediction step; skipping empty prediction execution."
+            )
+            self.ingestion_program_exit_code = 0
+            self.ingestion_program_elapsed_time = 0
+            self._update_status(SubmissionStatus.SCORING)
+            return
 
         # Define directories for ingestion, scoring and submission
         ingestion_program_dir = os.path.join(self.root_dir, "ingestion_program")
@@ -1517,6 +1600,11 @@ class Run:
             raise SubmissionException("Failed to write metadata file.")
 
         if not self.is_scoring:
+            if not self.ingestion_program_data:
+                logger.info(
+                    "No ingestion program for prediction step; skipping prediction result upload."
+                )
+                return
             self._put_dir(self.prediction_result, self.output_dir)
         else:
             self._put_dir(self.scoring_result, self.output_dir)

@@ -150,6 +150,7 @@ def _send_to_compute_worker(submission, is_scoring):
 
     submission = Submission.objects.get(id=submission.id)
     task = submission.task
+    run_args['has_ingestion_program'] = bool(task.ingestion_program)
 
     if not is_scoring:
         run_args['prediction_result'] = make_url_sassy(
